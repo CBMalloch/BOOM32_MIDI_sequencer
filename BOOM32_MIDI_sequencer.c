@@ -234,44 +234,34 @@ int main(void)
 void __ISR(_TIMER_1_VECTOR, ipl2) _Timer1Handler(void)
 {
   // these interrupts should hit every 1 ms
-  static int counter = 0;
-  static int lastBlinkAt = 0;
-  static int lastADCAt = 0;
-  static int lastStepAt = 0;
-  static int lastPrintAt =  0;
-  counter++;
+  static int blinkCounter = 0;
+  static int adcCounter = 0;
+  static int stepCounter = 0;
+  static int printCounter = 0;
 
-  // avoid most timing glitches by using a common multiple
-  // unless otherwise calculated, 36000 is a good kludge, 
-  // being divisible by many numbers
-  if (counter == 360000000) counter = 0;
-
-  if (((counter - lastBlinkAt) * clock_interrupt_period_us >= LED_blink_period_ms * 1000)
-      || (counter < lastBlinkAt)) {
+  blinkCounter -= clock_interrupt_period_us;
+  if (blinkCounter <= 0) {
     LATBINV = 0x0020;
-    lastBlinkAt = counter;
+    blinkCounter = LED_blink_period_ms * 1000;
   }
   
-  // call for ADC in the main program every n ms
-  if (((counter - lastADCAt) * clock_interrupt_period_us >= ADC_interval_ms * 1000)
-      || (counter < lastADCAt)) {
+  adcCounter -= clock_interrupt_period_us;
+  if (adcCounter <= 0) {
     enableADC = 1;
     AD1CON1bits.SAMP = 1;
-    lastADCAt = counter;
+    adcCounter = ADC_interval_ms * 1000;
   }
-
-  // call for stepper in the main program every n ms
-  if (((counter - lastStepAt) * clock_interrupt_period_us >= stepper_interval_us)
-      || (counter < lastStepAt)) {
+  
+  stepCounter -= clock_interrupt_period_us;
+  if (stepCounter <= 0) {
     enableStep = 1;
-    lastStepAt = counter;
+    stepCounter = stepper_interval_us;
   }
 
-  // call for printing in the main program every n ms
-  if (((counter - lastPrintAt) * clock_interrupt_period_us >= print_interval_ms * 1000)
-      || (counter < lastPrintAt)) {
+  printCounter -= clock_interrupt_period_us;
+  if (printCounter <= 0) {
     enablePrint = 1;
-    lastPrintAt = counter;
+    printCounter = print_interval_ms * 1000;
   }
 
   mT1ClearIntFlag(); // clear the interrupt flag
