@@ -12,6 +12,7 @@
 // *****************************************************************************
 // *****************************************************************************
 
+#include <math.h>
 #include <p32xxxx.h>
 #include <GenericTypeDefs.h>
 #include <plib.h>
@@ -75,6 +76,8 @@ INT8 enableStep  = 0;
 int stepper_interval_us =  50000;
 INT8 theStep = 0;
 INT8 stepDirection = 1;  //CW
+float smoothedPotValue = 512.0;
+#define POTEWMAVALUE 0.4
 
 #define NSTEPS 8
 // R (0) <> G (3); Y (4) <> B (2)
@@ -131,7 +134,8 @@ int main(void)
   // = 40MHz / 1 / 64 / 1000 = 625
   // 40MHz / 1 / 8 / 100 = 625*8 = 5000
 
-  UINT16 timer_preset = (clock_interrupt_period_us / 8) * (FPB / 1000000);
+
+  UINT16 timer_preset = (clock_interrupt_period_us * (FPB / 1000000)) / 8;
   OpenTimer1(T1_ON | T1_SOURCE_INT | T1_PS_1_8, timer_preset);
  
   // set up timer interrupt with a priority of 2 and sub-priority of 0
@@ -179,30 +183,53 @@ int main(void)
       ADCresult = ADC1BUF0;
 
       AD1CON1bits.DONE = 0;
+
+      smoothedPotValue = smoothedPotValue * (1 - POTEWMAVALUE)
+                        + ADCresult * POTEWMAVALUE;
+      ADCresult = floor(smoothedPotValue + 0.5);
+    
+
+#if (0)
+      // direction not needed for BOOM32, but coded for testing
+      if (ADCresult > 512) {
+        stepDirection = 1;
+      } else {
+        stepDirection = -1;
+      }
+
+      // NOTE: my stepper asks for 12V and uses more than 200mA, which is the
+      //   limit of my bench power supply...
+      // That may be the limit of how fast we can step.
+      
+      // interval is least at extremes of pot travel
+      float scaledValue = abs(ADCresult - 512.0) / 512.0;  // 1 at ends to 0 in middle
+      scaledValue = 1.0 - sqrt(scaledValue);                 // 0 at ends to inf in middle
+      int temp = floor(scaledValue * 1000000 + 0.5);
+      #define min_stepper_interval_us 1000
+      #define max_stepper_interval_us 125000
+      stepper_interval_us = min_stepper_interval_us +
+                    scaledValue * (max_stepper_interval_us-min_stepper_interval_us);
+
+
+#else
+      // desired us/phase:
+      //                / 40-160 bpm
+      //                * 60 sec/min
+      //                * 1e6 us/sec
+      //                * 16-32 beats per rev
+      //                / 200 steps/rev
+      //                / 2 phases/step
+      // is 30000 to 120000 us
+      #define min_stepper_interval_us 15000
+      #define max_stepper_interval_us 125000
+      stepper_interval_us = min_stepper_interval_us
+        + (1023 - ADCresult) * 
+          ((max_stepper_interval_us - min_stepper_interval_us) / 1024);
+#endif
+
       enableADC = 0;
     }
 
-#if (0)
-    // direction not needed for BOOM32, but coded for testing
-    if (ADCresult > 512) {
-      stepDirection = 1;
-    } else {
-      stepDirection = -1;
-    }
-
-    // interval is least at extremes of pot travel
-    stepper_interval_us = max(200, abs(512 - ADCresult) * 200);
-#else
-    // desired us/phase:
-    //                / 40-160 bpm 
-    //                * 60 sec/min 
-    //                * 1e6 us/sec
-    //                * 32 beats per rev 
-    //                / 200 steps/rev
-    //                / 2 phases/step
-    // is 30000 to 120000
-    stepper_interval_us = 30000 + (1023 - ADCresult) * 90;
-#endif
 
     if (enableStep) {
 //      snprintf (strBuf, bufLen, "Step...\n");
@@ -234,34 +261,34 @@ int main(void)
 void __ISR(_TIMER_1_VECTOR, ipl2) _Timer1Handler(void)
 {
   // these interrupts should hit every 1 ms
-  static int blinkCounter = 0;
-  static int adcCounter = 0;
-  static int stepCounter = 0;
-  static int printCounter = 0;
+  static int blinkRemainingUs = 0;
+  static int adcRemainingUs = 0;
+  static int stepRemainingUs = 0;
+  static int printRemainingUs = 0;
 
-  blinkCounter -= clock_interrupt_period_us;
-  if (blinkCounter <= 0) {
+  blinkRemainingUs -= clock_interrupt_period_us;
+  if (blinkRemainingUs <= 0) {
     LATBINV = 0x0020;
-    blinkCounter = LED_blink_period_ms * 1000;
+    blinkRemainingUs = LED_blink_period_ms * 1000;
   }
   
-  adcCounter -= clock_interrupt_period_us;
-  if (adcCounter <= 0) {
+  adcRemainingUs -= clock_interrupt_period_us;
+  if (adcRemainingUs <= 0) {
     enableADC = 1;
     AD1CON1bits.SAMP = 1;
-    adcCounter = ADC_interval_ms * 1000;
+    adcRemainingUs = ADC_interval_ms * 1000;
   }
   
-  stepCounter -= clock_interrupt_period_us;
-  if (stepCounter <= 0) {
+  stepRemainingUs -= clock_interrupt_period_us;
+  if (stepRemainingUs <= 0) {
     enableStep = 1;
-    stepCounter = stepper_interval_us;
+    stepRemainingUs = stepper_interval_us;
   }
 
-  printCounter -= clock_interrupt_period_us;
-  if (printCounter <= 0) {
+  printRemainingUs -= clock_interrupt_period_us;
+  if (printRemainingUs <= 0) {
     enablePrint = 1;
-    printCounter = print_interval_ms * 1000;
+    printRemainingUs = print_interval_ms * 1000;
   }
 
   mT1ClearIntFlag(); // clear the interrupt flag

@@ -4,12 +4,12 @@
 ** 2012-04-15 v0.3 cbm
 **
 
- * A0  (02)
- * A1  (03)
+ * A0  (02) AN0
+ * A1  (03) AN1
  * B0  (04) PICkit 3 programming - MICRO PGD data
  * B1  (05) PICkit 3 programming - MICRO PGC clock
- * B2  (06)
- * B3  (07)
+ * B2  (06) AN4
+ * B3  (07) AN5
  * A2  (09) Stepper ch 0 red
  * A3  (10) Stepper ch 1 blue
  * B4  (11) Stepper ch 2 green
@@ -21,8 +21,8 @@
  * B10 (21) UART2 TX (assigned in main.c)
  * B11 (22) UART2 RX (assigned in main.c)
  * B13 (24) AN11 ADC input from potentiometer
- * B14 (25)
- * B15 (26)
+ * B14 (25) AN10
+ * B15 (26) AN9
 
 */
 
