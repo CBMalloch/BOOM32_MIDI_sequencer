@@ -2,7 +2,22 @@
   BOOM32_MIDI_sequencer
 
   Is currently just reading ADC and putting the readings out UART2.
-  Next step is to output MIDI instead
+  Next step is to develop auto-contrast filter
+  Then output MIDI
+  
+  Notes:
+    Discriminating between off (clear) and on (black)
+      1) determine light level by averaging all channels for one revolution
+      2) a change in light level will be reflected by a correlated change in 
+         the output of all channels taken together
+      3) any smoothing of readings should be scaled in terms of beats
+      4) don't like to use maxes or mins, since these reflect much noise
+      
+    However, we'll begin with a heuristic:
+      Set the discrimination level for each channel x% (try 75) of the way
+        from the min to the max observed during a measure of music 
+        (say 1/4 revolution).
+      Update the discriminator frequently.
       
 *******************************************************************************/
 
@@ -14,10 +29,10 @@
 
 #include <math.h>
 #include <p32xxxx.h>
-#include <GenericTypeDefs.h>
-#include <plib.h>
 #include <project_setup.h>
 #include <utility.h>
+#include <GenericTypeDefs.h>
+#include <plib.h>
 
 // *****************************************************************************
 // *****************************************************************************
@@ -51,46 +66,50 @@
 // *****************************************************************************
 // *****************************************************************************
 
-volatile int programStatus;
+#define DO_MIDI 0
+#define NOTE_NOTES 0
 
 // *****************************************************************************
 // *****************************************************************************
 // Section: Function Prototypes
 // *****************************************************************************
 // *****************************************************************************
-
-
 // *****************************************************************************
 // *****************************************************************************
 // Section: Constant Data
 // *****************************************************************************
 // *****************************************************************************
 
+volatile int programStatus;
 int clock_interrupt_period_us = 100;
-INT8 enableADC   = 0;
-INT8 enablePrint = 0;
-INT8 enableStep  = 0;
-#define LED_blink_period_ms 500
-#define ADC_interval_ms     100
-#define print_interval_ms   500
-int stepper_interval_us =  50000;
+volatile INT8 enableADC   = 0;
+volatile INT8 enablePrint = 0;
+volatile INT8 enableStep  = 0;
+#define LED_BLINK_PERIOD_MS 500
+#define ADC_INTERVAL_MS     100
+#define PRINT_INTERVAL_MS   100
+volatile int stepper_interval_us =  50000;
 INT8 theStep = 0;
 INT8 stepDirection = 1;  //CW
 float smoothedPotValue = 512.0;
 #define POTEWMAVALUE 0.4
+// 2 phases per pole, 4 poles per step, 200 steps per revolution
+#define PHASES_PER_REVOLUTION 1600
+float rpm = 0;
+#define ADC_READINGS_PER_LEVEL_REEVALUATION ( (int) ( 1 / 4.0 / rpm * 60 * 1000 / ADC_INTERVAL_MS ))
 
-#define NSTEPS 8
+#define PHASES_PER_STEP 8
 // R (0) <> G (3); Y (4) <> B (2)
-UINT8 stepSequence[NSTEPS][4] = {
-                                  {1, 0, 0, 0},
-                                  {1, 0, 0, 1},
-                                  {0, 0, 0, 1},
-                                  {0, 0, 1, 1},
-                                  {0, 0, 1, 0},
-                                  {0, 1, 1, 0},
-                                  {0, 1, 0, 0},
-                                  {1, 1, 0, 0},
-                                };
+UINT8 stepSequence[PHASES_PER_STEP][4] =  {
+                                            {1, 0, 0, 0},
+                                            {1, 0, 0, 1},
+                                            {0, 0, 0, 1},
+                                            {0, 0, 1, 1},
+                                            {0, 0, 1, 0},
+                                            {0, 1, 1, 0},
+                                            {0, 1, 0, 0},
+                                            {1, 1, 0, 0},
+                                          };
 
 // *****************************************************************************
 // *****************************************************************************
@@ -100,14 +119,23 @@ UINT8 stepSequence[NSTEPS][4] = {
 
 int main(void)
 {
+  UINT8   strBuf[bufLen];
+  UINT8   bank = 0;
+  #define NSENSORSPERBANK 4
+  UINT32  cPot, cSensor[2][NSENSORSPERBANK];
+  UINT8   i;
+  #define NSENSORSINSTALLED 5
+  UINT16 min_levels[NSENSORSINSTALLED], max_levels[NSENSORSINSTALLED], discriminators[NSENSORSINSTALLED];
+  #define DISCRIMINATORLEVELPCT ( 75 )
+  int steps_remaining_in_evaluation = 0;
+
+  BOOL noteIsOn[NSENSORSINSTALLED] = {0, 0, 0, 0, 0};
+  UINT32 sensorValue;
 
   SYSTEMConfigPerformance (FCY);
  
-  UINT32  ADCresult;
-   
-  // 1. initializations
-
   LED_TRIS = 0;
+  LED_MIDI_TRIS = 0;
   BTN_TRIS = 1;
 
   STEPPER0_TRIS = 0;
@@ -115,24 +143,27 @@ int main(void)
   STEPPER2_TRIS = 0;
   STEPPER3_TRIS = 0;
 
+  PWR_BANK0_TRIS = 0;  // disable both banks to start
+  PWR_BANK1_TRIS = 1;
+
   UART2_RX_PPS_REG = UART2_RX_PPS_ITM;
-  // U2RXRbits.U2RXR = 3;   //SET U2RX to RPB11 (Pin 22)
   UART2_TX_PPS_REG = UART2_TX_PPS_ITM;
-  // RPB10Rbits.RPB10R = 2; //SET RPB10R (Pin 21) to U2TX
 
   UARTConfigure(UART2, UART_ENABLE_PINS_TX_RX_ONLY);
   UARTSetFifoMode(UART2, UART_INTERRUPT_ON_TX_NOT_FULL | UART_INTERRUPT_ON_RX_NOT_EMPTY);
-  UARTSetLineControl(UART2, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_2);
-  UARTSetDataRate(UART2, FPB, 19200);
+  UARTSetLineControl(UART2, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
+  if (DO_MIDI) {
+    UARTSetDataRate(UART2, FPB, 31500);
+  } else {
+    UARTSetDataRate(UART2, FPB, 115200);
+  }
   UARTEnable(UART2, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
 
   // timer interrupt stuff...
 
-  // configure the core timer roll-over rate (1 msec)
+  // configure the core timer roll-over rate
   // the internal source is the Peripheral Clock
   // timer_preset = SYSCLK_freq / pb_div / additional prescale / desired_ticks_per_sec
-  // = 40MHz / 1 / 64 / 1000 = 625
-  // 40MHz / 1 / 8 / 100 = 625*8 = 5000
 
 
   UINT16 timer_preset = (clock_interrupt_period_us * (FPB / 1000000)) / 8;
@@ -149,49 +180,122 @@ int main(void)
   
   CloseADC10();	// ensure the ADC is off before setting the configuration
   
-  // CHONA negative input select for MUX A is Vref-
-  // channel 0 positive input for mux A is defined in header to POT_ADC_ITM
-  //   currently AN11, pin 24
-  SetChanADC10( ADC_CH0_NEG_SAMPLEA_NVREF | POT_ADC_ITM );
+  /*
+    Notes from ref chapter
+      must set the TRIS bits for these channels (1 (desired) by default)
+      AD1CON1
+        want form 32-bit integer (0b100)
+        we set the SAMP bit to begin sampling --no--
+          the ASAM bit will begin autosampling
+          combine this with CLRASAM which will clear ASAM after one set of samples
+          conversion should be auto after that
+        autoconvert when sampling has concluded (SSRC = 0b111)
+        Tad min is 65ns, which is 2.6 PBclock cycles
+        Tad min is 83.33ns, which is 3.3 PBclock cycles
+      AD1CON2
+        CSCNA on enables scanning of inputs according to AD1CSSL
+        maybe BUFM 2 8-word buffers rather than 1 16-word buffer
+        ALTS alternates between mux A and mux B
+      AD1CON3
+        ADRC use peripheral bus clock ADC_CONV_CLK_PB
+        TAD: use ADC clock divisor of 4 to give TAD of 100ns to exceed min of 83.33
+        Sample time (SAMC): use 2 TADs to provide 200ns sampling to exceed min of 132
+              
+        New strategy: set the bit to power the necessary bank, wait 200 us,
+        and then kick off a sample.
+        
+      AD1CHS
+        CH0SA and CH0SB not used when scanning channels; CH0NA and CH0NB *are* used
+      AD1PCFG
+        zero bits to configure channels as analog; set to zero on reset
+      AD1CSSL
+        one bits to select channel for scan
+        
+      Will want to scan all channels on one bank, then interrupt to switch banks
+      Protect user code by writing valid stuff during interrupt to user area
+      
+      
+      
+      settling time after switching is say 200 us (78us to 0.63 rise)
+      
+  */
+  AD1CON1 =   ADC_FORMAT_INTG32           // output in integer
+            | ADC_CLK_AUTO                // conversion begins with clock
+            | ADC_AUTO_SAMPLING_OFF       // don't yet start autosample
+          ;
+
+  AD1CON2 =   ADC_VREF_AVDD_AVSS          // ADC ref internal
+            | ADC_OFFSET_CAL_DISABLE      // disable offset test
+            | ADC_SCAN_ON                 // enable scan mode (CSCNA)
+            | ADC_SAMPLES_PER_INT_5 
+            | ADC_ALT_BUF_OFF             // use single buffer
+            | ADC_ALT_INPUT_OFF           // use MUX A only
+          ;
+ 
+  AD1CON3 =   ADC_SAMPLE_TIME_2           // use 2 TADs for sampling
+            | ADC_CONV_CLK_PB             // use PBCLK
+            | ADC_CONV_CLK_Tcy            // 4 PBCLK cycles, so TAD is 100ns
+          ;
+
+  // AD1CHS
+  //          CH0NA negative input select for MUX A is Vref-
+  //          ASAM will begin a sample sequence
+  //          CLRASAM will stop autosampling after completing one sequence
+  //          begin conversions automatically
+  SetChanADC10 (ADC_CH0_NEG_SAMPLEA_NVREF);
   
-  // Turn module on | ouput in integer | conversion begins with clock | disable autosample
-  AD1CON1 = ADC_FORMAT_INTG32 | ADC_CLK_AUTO | ADC_AUTO_SAMPLING_OFF;
-  // ADC ref internal    | disable offset test    | disable scan mode | 1 samples / interrupt | use single buffer | use MUX A only
-  AD1CON2 = ADC_VREF_AVDD_AVSS | ADC_OFFSET_CAL_DISABLE | ADC_SCAN_OFF | ADC_SAMPLES_PER_INT_1 | ADC_ALT_BUF_OFF | ADC_ALT_INPUT_OFF;
-  // use ADC internal clock | set sample time
-  // could also try ADC_CONV_CLK_PB which is the 125ns peripheral clock
-  AD1CON3 = ADC_CONV_CLK_INTERNAL_RC | ADC_SAMPLE_TIME_15;
-  // select pin AN0 for input scan
-  // AD1CSSLbits.CSSL0 = 1;
-
-  // EnableADC10(); // Enable the ADC
-  AD1CON1bits.ON = 1;
-  // mAD1IntEnable(1);
-
+  // AD1PCFG
+  
+  // these are in the order in which they will appear in BUF0
+  AD1CSSL =   LS0_ADC_ITM 
+            | LS1_ADC_ITM 
+            | LS2_ADC_ITM 
+            | LS3_ADC_ITM 
+            | POT_ADC_ITM
+          ;  
+  
+  EnableADC10();
 
   while(1) {
 
-    // enableADC is set periodically (ADC_interval_ms) by an interrupt service routine
+    // enableADC is set periodically (ADC_INTERVAL_MS) by an interrupt service routine
     if (enableADC) {
       
       // NOTE: the interrupt routine set AD1CON1bits.SAMP = 1;
       // use AN0, pin 2
       
-      // wait for the conversion to complete so there will be vaild data in ADC result registers
+      // wait for the conversions to complete
+      // so there will be vaild data in ADC result registers
       while ( ! AD1CON1bits.DONE );
   
-      ADCresult = ADC1BUF0;
+      for (i = 0; i < NSENSORSPERBANK; i++) {
+        cSensor[bank][i] = ReadADC10(i);
+      }
+      cPot = POT_ADC_VAL;
 
-      AD1CON1bits.DONE = 0;
-
-      smoothedPotValue = smoothedPotValue * (1 - POTEWMAVALUE)
-                        + ADCresult * POTEWMAVALUE;
-      ADCresult = floor(smoothedPotValue + 0.5);
+      // current setup has 5 sensors: 2 in bank 0, 3 in bank 1
+      if (1 && enablePrint && !DO_MIDI) {
+        snprintf (strBuf, bufLen, 
+          "%5d <-> %5d | %5d <-> %5d | %5d <-> %5d | %5d <-> %5d | %5d <-> %5d || %5d %3.2f\n",
+          cSensor[0][0], discriminators[0],
+          cSensor[0][1], discriminators[1],
+          cSensor[1][0], discriminators[2],
+          cSensor[1][1], discriminators[3],
+          cSensor[1][2], discriminators[4],
+          cPot,
+          rpm
+         );
+        SendDataBuffer (strBuf, strlen(strBuf));
+        enablePrint = 0;
+      }
+      smoothedPotValue = smoothedPotValue * (1.0 - POTEWMAVALUE)
+                        + cPot * POTEWMAVALUE;
+      cPot = floor(smoothedPotValue + 0.5);
     
 
 #if (0)
       // direction not needed for BOOM32, but coded for testing
-      if (ADCresult > 512) {
+      if (cPot > 512) {
         stepDirection = 1;
       } else {
         stepDirection = -1;
@@ -202,7 +306,7 @@ int main(void)
       // That may be the limit of how fast we can step.
       
       // interval is least at extremes of pot travel
-      float scaledValue = abs(ADCresult - 512.0) / 512.0;  // 1 at ends to 0 in middle
+      float scaledValue = abs(cPot - 512.0) / 512.0;  // 1 at ends to 0 in middle
       scaledValue = 1.0 - sqrt(scaledValue);                 // 0 at ends to inf in middle
       int temp = floor(scaledValue * 1000000 + 0.5);
       #define min_stepper_interval_us 1000
@@ -210,34 +314,108 @@ int main(void)
       stepper_interval_us = min_stepper_interval_us +
                     scaledValue * (max_stepper_interval_us-min_stepper_interval_us);
 
-
 #else
       // desired us/phase:
       //                / 40-160 bpm
+      //                * 16-32 beats per rev
+      //                      ==> 40/32=1.25 - 160/16=10 RPM
+      //                / 200 steps/rev
+      //                / 4 coils / step
+      //                / 2 phases/coil
       //                * 60 sec/min
       //                * 1e6 us/sec
-      //                * 16-32 beats per rev
-      //                / 200 steps/rev
-      //                / 2 phases/step
-      // is 30000 to 120000 us
-      #define min_stepper_interval_us 15000
-      #define max_stepper_interval_us 125000
+      //                      --> factor = 15e6/400 = 3.75e4
+      //                ==> is 3.75e3 (fast) - 6.0e4
+      // is 7500 to 60000 us/phase
+      #define min_stepper_interval_us   3750
+      #define max_stepper_interval_us  30000
       stepper_interval_us = min_stepper_interval_us
-        + (1023 - ADCresult) * 
-          ((max_stepper_interval_us - min_stepper_interval_us) / 1024);
+        + ((1023 - cPot) *
+          (max_stepper_interval_us - min_stepper_interval_us)) / 1024;
+      rpm = ( 60 * 1e6 / stepper_interval_us) / PHASES_PER_REVOLUTION;
 #endif
 
-      enableADC = 0;
-    }
+      steps_remaining_in_evaluation--;
+      if (steps_remaining_in_evaluation <= 0) {
+        for (i = 0; i < NSENSORSINSTALLED; i++) {
+          discriminators[i] = min_levels[i] + (max_levels[i] - min_levels[i]) * DISCRIMINATORLEVELPCT / 100;
+          min_levels[i] = 1024;
+          max_levels[i] = 0;
+        }
+        // SendDataBuffer ("\n\n", 2);
+        steps_remaining_in_evaluation = ADC_READINGS_PER_LEVEL_REEVALUATION;
+      }
+      
+      // make determinations about what's on and what's off
+      for (i = 0; i < NSENSORSINSTALLED; i++) {
+        if (i < 2) {
+          sensorValue = cSensor[0][i];
+        } else {
+          sensorValue = cSensor[1][i - 2];
+        }
+        if (sensorValue < min_levels[i]) min_levels[i] = sensorValue;
+        if (sensorValue > max_levels[i]) max_levels[i] = sensorValue;
+        
+        BOOL currentValue = sensorValue < discriminators[i];
+        if (noteIsOn[i] != currentValue) {
+          if (currentValue) {
+            // turn note on
+            if (DO_MIDI) {
+              snprintf (strBuf, bufLen, "%c%c%c", (char) 0x99, (char) i, (char) 64);
+            } else if (NOTE_NOTES) {
+              snprintf (strBuf, bufLen, "NoteOn (%d)\n", i);
+            }
+          } else {
+            // turn note off
+            if (DO_MIDI) {
+              snprintf (strBuf, bufLen, "%c%c%c", (char) 0x89, (char) i, (char) 64);
+            } else if (NOTE_NOTES) {
+              snprintf (strBuf, bufLen, "NoteOff (%d)\n", i);
+            }
+          }
+          if (i == 0) LED_MIDI = currentValue;
+          SendDataBuffer (strBuf, strlen(strBuf));
+          noteIsOn[i] = currentValue;
+        }
+      }
 
+      if (0) {
+        snprintf  (strBuf, bufLen, "%8d : %3d %3d : %3d %3d : %3d %3d : %3d %3d : %3d %3d :\n",
+                    steps_remaining_in_evaluation,
+                    min_levels[0], max_levels[0],
+                    min_levels[1], max_levels[1],
+                    min_levels[2], max_levels[2],
+                    min_levels[3], max_levels[3],
+                    min_levels[4], max_levels[4]
+                  );
+        SendDataBuffer (strBuf, strlen(strBuf));
+      }
+
+
+      
+      // switch banks
+      bank = 1 - bank;
+      if (bank == 0) {
+        PWR_BANK1 = 0;
+        PWR_BANK1_TRIS = 1;
+        PWR_BANK0 = 1;
+        PWR_BANK0_TRIS = 0;
+      } else {
+        PWR_BANK0 = 0;
+        PWR_BANK0_TRIS = 1;
+        PWR_BANK1 = 1;
+        PWR_BANK1_TRIS = 0;
+      }
+
+      AD1CON1bits.DONE = 0;
+      enableADC = 0;
+
+    }  // ADC enabled
 
     if (enableStep) {
-//      snprintf (strBuf, bufLen, "Step...\n");
-//      SendDataBuffer (strBuf, strlen(strBuf));
-
       theStep += stepDirection;
-      if (theStep >= NSTEPS) theStep = 0;
-      if (theStep < 0) theStep = NSTEPS - 1;
+      if (theStep >= PHASES_PER_STEP) theStep = 0;
+      if (theStep < 0) theStep = PHASES_PER_STEP - 1;
 
       STEPPER0 = stepSequence[theStep][0];
       STEPPER1 = stepSequence[theStep][1];
@@ -250,9 +428,9 @@ int main(void)
     if (enablePrint) {
 //      snprintf (strBuf, bufLen, "  stepper_interval_ms = %d\n", stepper_interval_ms);
 //      SendDataBuffer (strBuf, strlen(strBuf));
-      enablePrint = 0;
+//      enablePrint = 0;
     }
-  }
+  }  // infinite loop
 
   return -1;
 }
@@ -260,23 +438,23 @@ int main(void)
 
 void __ISR(_TIMER_1_VECTOR, ipl2) _Timer1Handler(void)
 {
-  // these interrupts should hit every 1 ms
+  // this interrupt should fire every 1 ms
   static int blinkRemainingUs = 0;
   static int adcRemainingUs = 0;
   static int stepRemainingUs = 0;
-  static int printRemainingUs = 0;
+  static int printRemainingUs = PRINT_INTERVAL_MS * 1000;
 
   blinkRemainingUs -= clock_interrupt_period_us;
   if (blinkRemainingUs <= 0) {
-    LATBINV = 0x0020;
-    blinkRemainingUs = LED_blink_period_ms * 1000;
+    LED = 1 - LED;
+    blinkRemainingUs = LED_BLINK_PERIOD_MS * 1000;
   }
-  
+ 
   adcRemainingUs -= clock_interrupt_period_us;
   if (adcRemainingUs <= 0) {
     enableADC = 1;
-    AD1CON1bits.SAMP = 1;
-    adcRemainingUs = ADC_interval_ms * 1000;
+    AD1CON1bits.ASAM = 1;
+    adcRemainingUs = ADC_INTERVAL_MS * 1000;
   }
   
   stepRemainingUs -= clock_interrupt_period_us;
@@ -288,7 +466,7 @@ void __ISR(_TIMER_1_VECTOR, ipl2) _Timer1Handler(void)
   printRemainingUs -= clock_interrupt_period_us;
   if (printRemainingUs <= 0) {
     enablePrint = 1;
-    printRemainingUs = print_interval_ms * 1000;
+    printRemainingUs = PRINT_INTERVAL_MS * 1000;
   }
 
   mT1ClearIntFlag(); // clear the interrupt flag

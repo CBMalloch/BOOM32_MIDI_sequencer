@@ -16,7 +16,7 @@
 void Delayms (unsigned);
 void PlayPattern (UINT32);
 
-#define bufLen 80
+#define bufLen 160
 extern UINT8   strBuf[bufLen];
 
 void SendDataBuffer (const char*, UINT32);
